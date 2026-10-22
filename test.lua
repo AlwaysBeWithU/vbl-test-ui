@@ -66,29 +66,53 @@ local function getLevel()
 	return 0
 end
 
--- [เพิ่มใหม่] ฟังก์ชันเช็กจำนวน Lucky Spin ของผู้เล่น
+-- ===== ฟังก์ชันเช็กเฉพาะ Lucky Spin =====
 local function getLuckySpins()
-	-- 1. ลองเช็กจาก Leaderstats / PlayerData ในตัวผู้เล่นก่อน
-	local leaderstats = player:FindFirstChild("leaderstats") or player:FindFirstChild("Data") or player:FindFirstChild("PlayerData")
-	if leaderstats then
-		local spinsVal = leaderstats:FindFirstChild("LuckySpins") or leaderstats:FindFirstChild("LuckySpin") or leaderstats:FindFirstChild("Spins")
-		if spinsVal and spinsVal:IsA("ValueBase") then
-			return tonumber(spinsVal.Value) or 0
+	-- 1. ค้นหาจาก Attributes ในตัวผู้เล่นและตัวละครก่อน (แม่นยำที่สุด)
+	local char = workspace:FindFirstChild(player.Name)
+	if char then
+		for name, value in pairs(char:GetAttributes()) do
+			if name:lower():find("luckyspin") or name:lower():find("lucky_spin") then
+				local num = tonumber(value)
+				if num then return num end
+			end
 		end
 	end
 
-	-- 2. ถ้าไม่พบใน Leaderstats ให้ลองหาจาก UI ใน PlayerGui
+	for name, value in pairs(player:GetAttributes()) do
+		if name:lower():find("luckyspin") or name:lower():find("lucky_spin") then
+			local num = tonumber(value)
+			if num then return num end
+		end
+	end
+
+	-- 2. ค้นหาจาก Folder Data / Leaderstats ในตัวผู้เล่น
+	for _, child in ipairs(player:GetChildren()) do
+		if child:IsA("Folder") or child:IsA("Configuration") or child.Name:lower():find("data") or child.Name == "leaderstats" then
+			for _, val in ipairs(child:GetChildren()) do
+				if val:IsA("ValueBase") and (val.Name:lower():find("luckyspin") or val.Name:lower():find("lucky")) then
+					return tonumber(val.Value) or 0
+				end
+			end
+		end
+	end
+
+	-- 3. หากดึงจาก UI ให้หาเฉพาะใน LuckyList เท่านั้น (ไม่ดึงจาก SpinsLeft)
 	local playerGui = player:FindFirstChild("PlayerGui")
 	if playerGui then
-		for _, gui in ipairs(playerGui:GetChildren()) do
-			if gui:IsA("ScreenGui") then
-				local spinsLabel = gui:FindFirstChild("LuckySpin", true) 
-					or gui:FindFirstChild("LuckySpins", true)
-					or gui:FindFirstChild("LuckySpinAmount", true)
-				
-				if spinsLabel and (spinsLabel:IsA("TextLabel") or spinsLabel:IsA("TextBox")) then
-					local num = tonumber(spinsLabel.Text:match("%d+"))
-					if num then return num end
+		local luckyList = playerGui:FindFirstChild("Interface", true)
+			and playerGui.Interface:FindFirstChild("Lobby", true)
+			and playerGui.Interface.Lobby:FindFirstChild("Styles", true)
+			and playerGui.Interface.Lobby.Styles:FindFirstChild("BottomPanel", true)
+			and playerGui.Interface.Lobby.Styles.BottomPanel:FindFirstChild("LuckyList", true)
+
+		if luckyList then
+			for _, gui in ipairs(luckyList:GetDescendants()) do
+				if (gui:IsA("TextLabel") or gui:IsA("TextBox")) and gui.Text ~= "" then
+					local num = tonumber(gui.Text:match("%d+"))
+					if num and not gui.Name:lower():find("price") then
+						return num
+					end
 				end
 			end
 		end
@@ -122,7 +146,7 @@ local function sendLog(status, rolls)
 		return
 	end
 
-	-- อ่านสดทุกครั้ง ถ้า Nametag/เสื้อหาย (ตาย/เกิดใหม่) ใช้ค่าล่าสุดแทน
+	-- อ่านสดทุกครั้ง ถ้า Nametag/เสื้อหาย ใช้ค่าล่าสุดแทน
 	local level = getLevel()
 	if level > 0 then state.lastLevel = level else level = state.lastLevel end
 
@@ -137,10 +161,9 @@ local function sendLog(status, rolls)
 		luckySpins = state.lastLuckySpins 
 	end
 
-	-- [ปรับแต่งข้อความ Log] เพิ่มจำนวน Lucky Spin เข้าไปในข้อความ
-	local msg = clean("🌲Level : " .. level .. " , ⚔️ Style : " .. style .. " , 🎲 Lucky Spins : " .. luckySpins .. " , " .. status)
+	-- ตัด Emoji ออกเพื่อป้องกันปัญหาระบบ Horst อ่านค่าไม่ได้
+	local msg = clean("🌲Level : " .. level .. " , ⚔️Style : " .. style .. " , 🍀Lucky Spins : " .. luckySpins .. " , " .. status)
 
-	-- [ปรับแต่ง JSON Data] แนบข้อมูล LuckySpins เข้า JSON
 	local json = HttpService:JSONEncode({
 		Level = level,
 		Style = style,
@@ -186,7 +209,7 @@ end
 -- ==================== ลูปส่ง log ทุก N วินาที ====================
 local function runStatusLoop()
 	local interval = tonumber(getCfg("LOG_INTERVAL")) or DEFAULT.LOG_INTERVAL
-	if interval < 10 then interval = 10 end -- กันตั้งถี่เกินไป
+	if interval < 10 then interval = 10 end
 
 	print("[Log] ส่ง log ทุก", interval, "วินาที")
 
@@ -212,7 +235,6 @@ local function runRedeem()
 
 	print("[Redeem] เปิด | รอเลเวล:", REDEEM_LEVEL, "| จำนวนโค้ด:", #CODES)
 
-	-- รอจนเลเวลถึงเกณฑ์
 	while true do
 		if not isAutoRedeem() then
 			print("[Redeem] ปิดอยู่ หยุดทำงาน")
@@ -280,14 +302,12 @@ local function runRoll()
 		"| โหมด:", isLuckySpin() and "Lucky Spin" or "Normal Spin",
 		"| เป้าหมาย:", table.concat(WANTED, ", "), "| สูงสุด:", MAX_ROLLS)
 
-	-- เช็กก่อนเริ่ม เผื่อได้ตัวที่ต้องการอยู่แล้ว
 	local startStyle = getStyle()
 	if startStyle ~= "" and isWanted(startStyle) then
 		finish("ได้ตัวที่ต้องการแล้ว", 0, true)
 		return
 	end
 
-	-- ปิด Auto Roll: ส่งสถานะปัจจุบัน (ลูปส่ง log จะอัปเดตต่อเอง) แล้วจบส่วนสุ่ม
 	if not isAutoRoll() then
 		finish("ปิด Auto Roll (ไม่สุ่ม)", 0, false)
 		return
@@ -307,9 +327,9 @@ local function runRoll()
 
 		local ok, result = pcall(function()
 			if isLuckySpin() then
-				return Roll:InvokeServer(true) -- Lucky Spin
+				return Roll:InvokeServer(true)
 			end
-			return Roll:InvokeServer()         -- Normal Spin
+			return Roll:InvokeServer()
 		end)
 
 		if not ok then
@@ -335,7 +355,6 @@ local function runRoll()
 		local style = getStyle()
 		print(("[Roll] สุ่มครั้งที่ %d -> %s"):format(i, style))
 
-		-- อัปเดตสถานะให้ลูปส่ง log หยิบไปส่งรอบถัดไป
 		state.status = ("กำลังสุ่ม สุ่มไปแล้ว %d ครั้ง"):format(i)
 		state.rolls = i
 

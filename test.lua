@@ -7,10 +7,11 @@ local Services = RS.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
 local Roll = Services.StyleService.RF.Roll
 local RequestJerseyUpdate = Services.JerseyService.RF.RequestJerseyUpdate
 local Redeem = Services.CodeService.RF.Redeem
+local ClaimLevelRewards = Services.LevelService.RF.ClaimLevelRewards
 
--- ===== อ่าน Config (ถ้าไม่ได้ตั้ง ใช้ค่าเริ่มต้น) =====
+-- ===== Config (ถ้าไม่ได้ตั้ง ใช้ค่าเริ่มต้น) =====
 local DEFAULT = {
-	AUTO_ROLL = true,
+	AUTO_ROLL = false,
 	LUCKY_SPIN = true,
 	WANTED = { "Sanju", "Kisuki" },
 	MAX_ROLLS = 500,
@@ -24,6 +25,22 @@ local DEFAULT = {
 	LOG_INTERVAL = 60,
 }
 
+-- เตรียม _G.RollConfig ให้ UI แก้ค่าได้ (ค่าที่ไม่ได้ตั้งจะเติมจาก DEFAULT)
+if type(_G.RollConfig) ~= "table" then
+	_G.RollConfig = {}
+end
+for k, v in pairs(DEFAULT) do
+	if _G.RollConfig[k] == nil then
+		if type(v) == "table" then
+			local copy = {}
+			for i, x in ipairs(v) do copy[i] = x end
+			_G.RollConfig[k] = copy
+		else
+			_G.RollConfig[k] = v
+		end
+	end
+end
+
 local function getCfg(key)
 	local user = type(_G.RollConfig) == "table" and _G.RollConfig or {}
 	if user[key] ~= nil then
@@ -32,7 +49,6 @@ local function getCfg(key)
 	return DEFAULT[key]
 end
 
--- อ่านสดทุกครั้ง เพื่อสลับเปิด/ปิดระหว่างรันได้
 local function isAutoRoll() return getCfg("AUTO_ROLL") == true end
 local function isAutoRedeem() return getCfg("AUTO_REDEEM") == true end
 local function isLuckySpin() return getCfg("LUCKY_SPIN") == true end
@@ -66,38 +82,31 @@ local function getLevel()
 	return 0
 end
 
--- ===== ฟังก์ชันเช็กเฉพาะ Lucky Spin =====
 local function getLuckySpins()
-	-- 1. ค้นหาจาก Attributes ในตัวผู้เล่นและตัวละครก่อน (แม่นยำที่สุด)
 	local char = workspace:FindFirstChild(player.Name)
-	if char then
-		for name, value in pairs(char:GetAttributes()) do
-			if name:lower():find("luckyspin") or name:lower():find("lucky_spin") then
-				local num = tonumber(value)
-				if num then return num end
-			end
-		end
-	end
-
-	for name, value in pairs(player:GetAttributes()) do
-		if name:lower():find("luckyspin") or name:lower():find("lucky_spin") then
-			local num = tonumber(value)
-			if num then return num end
-		end
-	end
-
-	-- 2. ค้นหาจาก Folder Data / Leaderstats ในตัวผู้เล่น
-	for _, child in ipairs(player:GetChildren()) do
-		if child:IsA("Folder") or child:IsA("Configuration") or child.Name:lower():find("data") or child.Name == "leaderstats" then
-			for _, val in ipairs(child:GetChildren()) do
-				if val:IsA("ValueBase") and (val.Name:lower():find("luckyspin") or val.Name:lower():find("lucky")) then
-					return tonumber(val.Value) or 0
+	for _, src in ipairs({ char, player }) do
+		if src then
+			for name, value in pairs(src:GetAttributes()) do
+				local n = name:lower()
+				if n:find("luckyspin") or n:find("lucky_spin") then
+					local num = tonumber(value)
+					if num then return num end
 				end
 			end
 		end
 	end
 
-	-- 3. หากดึงจาก UI ให้หาเฉพาะใน LuckyList เท่านั้น (ไม่ดึงจาก SpinsLeft)
+	for _, child in ipairs(player:GetChildren()) do
+		if child:IsA("Folder") or child:IsA("Configuration") or child.Name:lower():find("data") or child.Name == "leaderstats" then
+			for _, val in ipairs(child:GetChildren()) do
+				if val:IsA("ValueBase") and val.Name:lower():find("lucky") then
+					local num = tonumber(val.Value)
+					if num then return num end
+				end
+			end
+		end
+	end
+
 	local playerGui = player:FindFirstChild("PlayerGui")
 	if playerGui then
 		local luckyList = playerGui:FindFirstChild("Interface", true)
@@ -118,20 +127,19 @@ local function getLuckySpins()
 		end
 	end
 
-	return 0
+	return nil -- อ่านไม่เจอ (ไม่ใช่ 0)
 end
 
--- สถานะกลาง (ลูปส่ง log อ่านจากตรงนี้)
-local state = { 
-	status = "เริ่มทำงาน", 
-	rolls = 0, 
-	lastLevel = 0, 
+-- ===== สถานะกลาง =====
+local state = {
+	status = "เริ่มทำงาน",
+	rolls = 0,
+	lastLevel = 0,
 	lastStyle = "",
-	lastLuckySpins = 0 
+	lastLuckySpins = nil,
 }
-
--- สถานะระบบใส่โค้ด
 local redeemState = { finished = false, success = 0, failed = 0, ran = false }
+local claimState = { success = 0, failed = 0 }
 
 local function redeemSummary()
 	if not redeemState.ran then
@@ -146,23 +154,21 @@ local function sendLog(status, rolls)
 		return
 	end
 
-	-- อ่านสดทุกครั้ง ถ้า Nametag/เสื้อหาย ใช้ค่าล่าสุดแทน
 	local level = getLevel()
 	if level > 0 then state.lastLevel = level else level = state.lastLevel end
 
 	local style = getStyle()
 	if style ~= "" then state.lastStyle = style else style = state.lastStyle end
 
-	-- เช็ก Lucky Spins
 	local luckySpins = getLuckySpins()
-	if luckySpins > 0 or state.lastLuckySpins == 0 then 
-		state.lastLuckySpins = luckySpins 
-	else 
-		luckySpins = state.lastLuckySpins 
+	if luckySpins ~= nil then
+		state.lastLuckySpins = luckySpins
+	else
+		luckySpins = state.lastLuckySpins
 	end
 
-	-- ตัด Emoji ออกเพื่อป้องกันปัญหาระบบ Horst อ่านค่าไม่ได้
-	local msg = clean("🌲Level : " .. level .. " , ⚔️Style : " .. style .. " , 🍀Lucky Spins : " .. luckySpins .. " , " .. status)
+	local luckyText = luckySpins ~= nil and tostring(luckySpins) or "N/A"
+	local msg = clean("🌲Level : " .. level .. " , ⚔️Style : " .. style .. " , 🍀Lucky Spins : " .. luckyText .. ", " .. status)
 
 	local json = HttpService:JSONEncode({
 		Level = level,
@@ -172,6 +178,8 @@ local function sendLog(status, rolls)
 		Status = status,
 		RedeemSuccess = redeemState.success,
 		RedeemFailed = redeemState.failed,
+		ClaimSuccess = claimState.success,
+		ClaimFailed = claimState.failed,
 	})
 
 	local ok, err = pcall(_G.Horst_SetDescription, msg, json)
@@ -180,7 +188,6 @@ local function sendLog(status, rolls)
 	end
 end
 
--- ส่ง log ด้วยสถานะล่าสุดที่จำไว้
 local function report()
 	sendLog(state.status .. " , " .. redeemSummary(), state.rolls)
 end
@@ -189,7 +196,6 @@ local function finish(status, rolls, markDone)
 	state.status = status
 	state.rolls = rolls
 
-	-- ถ้าตั้งไว้ รอระบบใส่โค้ดเสร็จก่อนส่ง Done
 	if markDone and getCfg("WAIT_REDEEM_BEFORE_DONE") == true then
 		while isAutoRedeem() and not redeemState.finished do
 			task.wait(1)
@@ -206,7 +212,7 @@ local function finish(status, rolls, markDone)
 	end
 end
 
--- ==================== ลูปส่ง log ทุก N วินาที ====================
+-- ==================== ลูปส่ง log ====================
 local function runStatusLoop()
 	local interval = tonumber(getCfg("LOG_INTERVAL")) or DEFAULT.LOG_INTERVAL
 	if interval < 10 then interval = 10 end
@@ -219,7 +225,44 @@ local function runStatusLoop()
 	end
 end
 
--- ==================== ระบบใส่โค้ด ====================
+-- ==================== รับของเลเวล ====================
+local function claimOnce(level)
+	local ok, result = pcall(function()
+		return ClaimLevelRewards:InvokeServer()
+	end)
+
+	if ok and result ~= false then
+		claimState.success += 1
+		print("[Claim] ✅ เลเวล", level, "->", tostring(result))
+	else
+		claimState.failed += 1
+		warn("[Claim] ❌ เลเวล", level, "->", tostring(result))
+	end
+end
+
+local function runClaim()
+	local lastLevel = 0
+	while lastLevel == 0 do
+		lastLevel = getLevel()
+		if lastLevel == 0 then task.wait(2) end
+	end
+
+	print("[Claim] เริ่มทำงาน | เลเวลปัจจุบัน:", lastLevel)
+	claimOnce(lastLevel)
+
+	while true do
+		task.wait(3)
+		local level = getLevel()
+
+		if level > lastLevel then
+			print(("[Claim] เลเวลเพิ่ม %d -> %d"):format(lastLevel, level))
+			claimOnce(level)
+			lastLevel = level
+		end
+	end
+end
+
+-- ==================== ใส่โค้ด ====================
 local function runRedeem()
 	local CODES = getCfg("CODES")
 	if type(CODES) == "string" then
@@ -274,7 +317,7 @@ local function runRedeem()
 	print(("[Redeem] เสร็จแล้ว สำเร็จ %d / ไม่สำเร็จ %d"):format(redeemState.success, redeemState.failed))
 end
 
--- ==================== ระบบสุ่ม ====================
+-- ==================== สุ่ม ====================
 local function runRoll()
 	local WANTED = getCfg("WANTED")
 	if type(WANTED) == "string" then
@@ -367,18 +410,242 @@ local function runRoll()
 	finish("สุ่มครบ " .. MAX_ROLLS .. " ครั้ง ยังไม่ได้ตัวที่ต้องการ", rolls, false)
 end
 
--- ==================== เริ่มทำงาน ====================
-task.spawn(function()
-	pcall(runStatusLoop)
-end)
+-- ==================== ตัวช่วยสำหรับ UI ====================
+local cfg = _G.RollConfig
 
-if isAutoRedeem() then
+-- รายการ Style ที่ให้เลือกในเมนู (เพิ่ม/ลบตามที่มีในเกม)
+local STYLE_OPTIONS = { "Kisuki", "Sanju", "Mamori" }
+
+-- รวมตัวเลือกกับค่าที่ตั้งไว้ใน config กันค่าที่เลือกไว้ไม่อยู่ในลิสต์
+local function mergeOptions(options, selected)
+	local out, seen = {}, {}
+	for _, v in ipairs(options) do
+		local key = tostring(v):lower()
+		if not seen[key] then
+			seen[key] = true
+			table.insert(out, tostring(v))
+		end
+	end
+	for _, v in ipairs(selected or {}) do
+		local key = tostring(v):lower()
+		if not seen[key] then
+			seen[key] = true
+			table.insert(out, tostring(v))
+		end
+	end
+	return out
+end
+
+local function toList(v)
+	if type(v) == "table" then return v end
+	if v == nil or v == "" then return {} end
+	return { v }
+end
+
+-- แปลง "a, b, c" เป็น table
+local function splitList(text)
+	local t = {}
+	for item in tostring(text):gmatch("[^,]+") do
+		item = item:match("^%s*(.-)%s*$")
+		if item ~= "" then
+			table.insert(t, item)
+		end
+	end
+	return t
+end
+
+-- กันรันซ้อน
+local rollRunning = false
+local redeemRunning = false
+
+local function startRoll()
+	if rollRunning then return end
+	rollRunning = true
+	task.spawn(function()
+		pcall(runRoll)
+		rollRunning = false
+	end)
+end
+
+local function startRedeem()
+	if redeemRunning then return end
+	redeemRunning = true
+	redeemState.finished = false
 	task.spawn(function()
 		pcall(runRedeem)
 		redeemState.finished = true
+		redeemRunning = false
 	end)
+end
+
+-- ==================== เริ่มทำงาน (ใช้ WindUI) ====================
+task.spawn(function() pcall(runStatusLoop) end)
+task.spawn(function() pcall(runClaim) end)
+
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local Window = WindUI:CreateWindow({
+	Title = "Style Roller",
+	Icon = "dices",
+	Author = "Auto Roll & Redeem",
+	Folder = "StyleRoller",
+	Size = UDim2.fromOffset(580, 460),
+	Theme = "Dark",
+	ToggleKey = Enum.KeyCode.RightShift, -- กดซ่อน/แสดงหน้าต่าง
+})
+
+-- ================= แท็บสุ่ม =================
+local RollTab = Window:Tab({ Title = "สุ่ม", Icon = "dices" })
+local RollSection = RollTab:Section({ Title = "ตั้งค่าการสุ่ม", Opened = true })
+
+RollSection:Toggle({
+	Title = "Auto Roll",
+	Desc = "เปิดเพื่อเริ่มสุ่ม ปิดเพื่อหยุด",
+	Value = cfg.AUTO_ROLL == true,
+	Callback = function(v)
+		cfg.AUTO_ROLL = v
+		if v then startRoll() end
+	end,
+})
+
+RollSection:Toggle({
+	Title = "Lucky Spin",
+	Desc = "เปิด = Lucky Spin / ปิด = Normal Spin",
+	Value = cfg.LUCKY_SPIN == true,
+	Callback = function(v)
+		cfg.LUCKY_SPIN = v
+	end,
+})
+
+RollSection:Dropdown({
+	Title = "Style ที่ต้องการ",
+	Desc = "เลือกได้หลายตัว สุ่มเจอตัวไหนก็หยุด",
+	Values = mergeOptions(STYLE_OPTIONS, cfg.WANTED),
+	Value = cfg.WANTED or {},
+	Multi = true,
+	AllowNone = false,
+	Callback = function(selected)
+		local list = toList(selected)
+		if #list > 0 then
+			cfg.WANTED = list
+		end
+	end,
+})
+
+RollSection:Slider({
+	Title = "สุ่มสูงสุด (ครั้ง)",
+	Step = 10,
+	Value = { Min = 10, Max = 2000, Default = cfg.MAX_ROLLS or 500 },
+	Callback = function(v)
+		cfg.MAX_ROLLS = math.floor(v)
+	end,
+})
+
+RollSection:Slider({
+	Title = "รอหลังสุ่ม (วินาที)",
+	Step = 1,
+	Value = { Min = 1, Max = 10, Default = cfg.WAIT_AFTER_ROLL or 3 },
+	Callback = function(v)
+		cfg.WAIT_AFTER_ROLL = v
+	end,
+})
+
+RollSection:Toggle({
+	Title = "เรียก Jersey Update",
+	Desc = "เรียกอัปเดตเสื้อหลังสุ่มทุกครั้ง",
+	Value = cfg.CALL_JERSEY_UPDATE == true,
+	Callback = function(v)
+		cfg.CALL_JERSEY_UPDATE = v
+	end,
+})
+
+-- ================= แท็บใส่โค้ด =================
+local RedeemTab = Window:Tab({ Title = "ใส่โค้ด", Icon = "gift" })
+local RedeemSection = RedeemTab:Section({ Title = "ตั้งค่าใส่โค้ด", Opened = true })
+
+RedeemSection:Toggle({
+	Title = "Auto Redeem",
+	Desc = "รอเลเวลถึงเกณฑ์แล้วใส่โค้ดอัตโนมัติ",
+	Value = cfg.AUTO_REDEEM == true,
+	Callback = function(v)
+		cfg.AUTO_REDEEM = v
+		if v then startRedeem() end
+	end,
+})
+
+RedeemSection:Input({
+	Title = "โค้ด",
+	Desc = "คั่นด้วยจุลภาค เช่น UPDATE_92, PARRY, MAMORI",
+	Value = table.concat(cfg.CODES or {}, ", "),
+	Placeholder = "CODE1, CODE2",
+	Callback = function(text)
+		cfg.CODES = splitList(text)
+	end,
+})
+
+RedeemSection:Slider({
+	Title = "เลเวลที่เริ่มใส่โค้ด",
+	Step = 1,
+	Value = { Min = 1, Max = 100, Default = cfg.REDEEM_LEVEL or 15 },
+	Callback = function(v)
+		cfg.REDEEM_LEVEL = math.floor(v)
+	end,
+})
+
+RedeemSection:Slider({
+	Title = "หน่วงระหว่างโค้ด (วินาที)",
+	Step = 1,
+	Value = { Min = 1, Max = 10, Default = cfg.REDEEM_DELAY or 2 },
+	Callback = function(v)
+		cfg.REDEEM_DELAY = v
+	end,
+})
+
+RedeemSection:Button({
+	Title = "ใส่โค้ดเดี๋ยวนี้",
+	Desc = "เริ่มใส่โค้ดทันที (ถ้าเลเวลถึงเกณฑ์)",
+	Callback = function()
+		cfg.AUTO_REDEEM = true
+		startRedeem()
+	end,
+})
+
+-- ================= แท็บทั่วไป =================
+local MiscTab = Window:Tab({ Title = "ทั่วไป", Icon = "settings" })
+local MiscSection = MiscTab:Section({ Title = "ทั่วไป", Opened = true })
+
+MiscSection:Toggle({
+	Title = "รอใส่โค้ดเสร็จก่อนส่ง Done",
+	Value = cfg.WAIT_REDEEM_BEFORE_DONE == true,
+	Callback = function(v)
+		cfg.WAIT_REDEEM_BEFORE_DONE = v
+	end,
+})
+
+MiscSection:Slider({
+	Title = "ส่ง Log ทุก (วินาที)",
+	Desc = "มีผลเมื่อรันสคริปต์ใหม่",
+	Step = 5,
+	Value = { Min = 10, Max = 300, Default = cfg.LOG_INTERVAL or 60 },
+	Callback = function(v)
+		cfg.LOG_INTERVAL = math.floor(v)
+	end,
+})
+
+MiscSection:Button({
+	Title = "ส่ง Log ตอนนี้",
+	Callback = function()
+		report()
+	end,
+})
+
+RollTab:Select() -- เปิดแท็บสุ่มเป็นแท็บแรก
+
+-- เริ่มตามค่าที่ตั้งไว้ตอนต้น
+if isAutoRedeem() then
+	startRedeem()
 else
 	redeemState.finished = true
 end
 
-runRoll()
+startRoll() -- เช็ก Style ปัจจุบันก่อน ถ้า Auto Roll ปิดจะแค่ส่งสถานะแล้วจบ
